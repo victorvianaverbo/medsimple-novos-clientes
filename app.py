@@ -289,7 +289,15 @@ def load_baseline_from_gist() -> pd.DataFrame:
         timeout=30,
     )
     r.raise_for_status()
-    content = r.json()["files"]["new_clients.csv"]["content"]
+    file_info = r.json()["files"]["new_clients.csv"]
+    # GitHub trunca arquivos > 1 MB no campo "content" — usar raw_url para arquivos grandes
+    if file_info.get("truncated"):
+        raw_url = file_info["raw_url"]
+        r2 = requests.get(raw_url, headers={"Authorization": f"token {token}"}, timeout=60)
+        r2.raise_for_status()
+        content = r2.text
+    else:
+        content = file_info["content"]
     df = pd.read_csv(io.StringIO(content), dtype=str)
     df["data_primeira_compra"] = pd.to_datetime(df["data_primeira_compra"], errors="coerce", utc=True)
     df["ano"] = pd.to_numeric(df["ano"], errors="coerce").astype("Int64")
