@@ -42,6 +42,9 @@ def get_secret(key: str) -> str:
 # ── Hotmart ─────────────────────────────────────────────────────────────────
 def hotmart_get_token() -> str:
     basic = get_secret("HOTMART_BASIC")
+    # Garante que o prefixo 'Basic ' está presente
+    if not basic.startswith("Basic "):
+        basic = f"Basic {basic}"
     resp = requests.post(
         "https://api-sec-vlc.hotmart.com/security/oauth/token",
         headers={"Authorization": basic, "Content-Type": "application/x-www-form-urlencoded"},
@@ -68,9 +71,10 @@ def hotmart_fetch_all(progress_cb=None) -> list[dict]:
     records, page_token, page = [], None, 1
 
     while True:
-        params = {"max_results": 500, "transaction_status": "APPROVED,COMPLETE"}
+        # transaction_status deve ser enviado como parâmetros repetidos, não string única
+        params = [("max_results", 500), ("transaction_status", "APPROVED"), ("transaction_status", "COMPLETE")]
         if page_token:
-            params["page_token"] = page_token
+            params.append(("page_token", page_token))
 
         resp = requests.get(url, headers=headers, params=params, timeout=60)
         if resp.status_code == 429:
@@ -116,11 +120,12 @@ def guru_headers() -> dict:
 def guru_discover_endpoint() -> tuple[str, str]:
     """Descobre a URL base + path correto da API Guru."""
     candidates = [
+        ("https://digitalmanager.guru/api/v2", "/transactions"),
+        ("https://digitalmanager.guru/api/v1", "/transactions"),
+        ("https://digitalmanager.guru/api/v2", "/sales"),
+        ("https://digitalmanager.guru/api/v1", "/sales"),
         ("https://api.digitalmanager.guru/v2", "/transactions"),
         ("https://api.digitalmanager.guru/v1", "/transactions"),
-        ("https://api.digitalmanager.guru/v2", "/sales"),
-        ("https://api.digitalmanager.guru/v1", "/sales"),
-        ("https://api.digitalmanager.guru", "/transactions"),
     ]
     for base, path in candidates:
         try:
