@@ -6,6 +6,7 @@ Rodar localmente:   streamlit run app.py
 Deploy:             Streamlit Community Cloud (share.streamlit.io)
 """
 
+import io
 import os
 import time
 import requests
@@ -149,6 +150,11 @@ def guru_normalize(item: dict) -> dict | None:
     if status and not any(s in status for s in PAID_STATUSES):
         return None
 
+    # Filtrar apenas produto "Plataforma MEDsimple"
+    product_name = ((item.get("product") or {}).get("name") or "").lower()
+    if product_name and "plataforma medsimple" not in product_name:
+        return None
+
     return {
         "email": email,
         "telefone": phone,
@@ -269,68 +275,37 @@ def find_unique_clients(df: pd.DataFrame) -> pd.DataFrame:
     return first.rename(columns={"plataforma": "plataforma_primeira_compra"})
 
 
-# ── Normalizar CSV histórico ─────────────────────────────────────────────────
-def normalize_csv(uploaded_file, platform: str) -> pd.DataFrame:
-    """
-    Lê um CSV exportado da plataforma e normaliza para o formato padrão.
-    Tenta detectar automaticamente as colunas de email, telefone, nome e data.
-    """
-    df = pd.read_csv(uploaded_file, dtype=str, encoding_errors="replace")
-    df.columns = [c.strip().lower() for c in df.columns]
-
-    # Mapeamento flexível de colunas — cobre exports da Hotmart e Guru
-    COL_MAP = {
-        "email": ["email", "e-mail", "email do comprador", "buyer_email", "contact_email"],
-        "telefone": ["telefone", "phone", "phone_number", "celular", "tel", "fone"],
-        "nome": ["nome", "name", "nome completo", "buyer_name", "contact_name", "nome do comprador"],
-        "data_compra": [
-            "data", "date", "data da compra", "data do pedido", "purchase_date",
-            "approved_date", "ordered_at", "created_at", "confirmed_at",
-            "data de aprovação", "data aprovacao",
-        ],
-    }
-
-    rename = {}
-    for target, candidates in COL_MAP.items():
-        for c in candidates:
-            if c in df.columns and target not in rename.values():
-                rename[c] = target
-                break
-
-    df = df.rename(columns=rename)
-
-    # Garantir colunas mínimas
-    for col in ["email", "telefone", "nome", "data_compra"]:
-        if col not in df.columns:
-            df[col] = ""
-
-    df["email"] = df["email"].fillna("").str.strip().str.lower()
-    df["telefone"] = df["telefone"].fillna("").apply(
-        lambda x: "".join(filter(str.isdigit, str(x)))
+# ── Baseline (GitHub Gist) + API incremental ────────────────────────────────
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_baseline_from_gist() -> pd.DataFrame:
+    """Carrega o baseline pré-processado do GitHub Gist privado."""
+    token = get_secret("GITHUB_GIST_TOKEN")
+    gist_id = get_secret("GITHUB_GIST_ID")
+    if not token or not gist_id:
+        return pd.DataFrame()
+    r = requests.get(
+        f"https://api.github.com/gists/{gist_id}",
+        headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
+        timeout=30,
     )
-    df["nome"] = df["nome"].fillna("").str.strip()
-    df["data_compra"] = pd.to_datetime(df["data_compra"], errors="coerce", utc=True)
-    df["plataforma"] = platform
-
-    before = len(df)
-    df = df.dropna(subset=["data_compra"])
-    df = df[df["email"].str.len() > 0 | df["telefone"].str.len() > 0]
-    st.caption(f"CSV {platform}: {len(df)}/{before} linhas válidas.")
-    return df[["email", "telefone", "nome", "data_compra", "plataforma"]]
+    r.raise_for_status()
+    content = r.json()["files"]["new_clients.csv"]["content"]
+    df = pd.read_csv(io.StringIO(content), dtype=str)
+    df["data_primeira_compra"] = pd.to_datetime(df["data_primeira_compra"], errors="coerce", utc=True)
+    df["ano"] = pd.to_numeric(df["ano"], errors="coerce").astype("Int64")
+    df["mes"] = pd.to_numeric(df["mes"], errors="coerce").astype("Int64")
+    return df
 
 
-# ── Fetch da API apenas dados recentes ──────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_recent_hotmart(since_date_str: str) -> list[dict]:
-    """Busca vendas Hotmart a partir de uma data (formato YYYY-MM-DD)."""
-    from datetime import timedelta
+    """Busca vendas Hotmart aprovadas a partir de uma data."""
     since = datetime.strptime(since_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     since_ms = int(since.timestamp() * 1000)
-
     token = hotmart_get_token()
     headers = {"Authorization": f"Bearer {token}"}
     url = "https://developers.hotmart.com/payments/api/v1/sales/history"
-    records, page_token, page = [], None, 1
+    records, page_token = [], None
 
     while True:
         params = [
@@ -341,14 +316,12 @@ def fetch_recent_hotmart(since_date_str: str) -> list[dict]:
         ]
         if page_token:
             params.append(("page_token", page_token))
-
         resp = requests.get(url, headers=headers, params=params, timeout=60)
         if resp.status_code == 429:
             time.sleep(30)
             continue
         resp.raise_for_status()
         data = resp.json()
-
         for item in data.get("items", []):
             buyer = item.get("buyer") or {}
             purchase = item.get("purchase") or {}
@@ -362,27 +335,22 @@ def fetch_recent_hotmart(since_date_str: str) -> list[dict]:
                 "data_compra": ms_to_dt(purchase.get("approved_date") or purchase.get("order_date")),
                 "plataforma": "hotmart",
             })
-
         pi = data.get("page_info") or {}
-        next_token = pi.get("next_page_token")
-        if not next_token or not data.get("items"):
+        page_token = pi.get("next_page_token")
+        if not page_token or not data.get("items"):
             break
-        page_token, page = next_token, page + 1
         time.sleep(0.4)
-
     return records
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_recent_guru(since_date_str: str) -> list[dict]:
-    """Busca transações Guru a partir de uma data (formato YYYY-MM-DD)."""
+    """Busca transações Guru (Plataforma MEDsimple) a partir de uma data."""
     from datetime import timedelta
-
     since = datetime.strptime(since_date_str, "%Y-%m-%d").date()
     today = date.today()
     records = []
     window_start = since
-
     while window_start <= today:
         window_end = min(window_start + timedelta(days=GURU_WINDOW_DAYS), today)
         try:
@@ -390,83 +358,67 @@ def fetch_recent_guru(since_date_str: str) -> list[dict]:
         except Exception:
             pass
         window_start = window_end + timedelta(days=1)
-
     return records
 
 
-# ── Fetch completo com cache ────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_data_from_api() -> pd.DataFrame:
-    """Fallback: busca tudo das APIs (sem CSV histórico)."""
+def load_data() -> pd.DataFrame:
+    """
+    Carrega baseline do Gist e complementa com dados recentes das APIs.
+    """
     status_box = st.empty()
 
-    def progress(msg):
-        status_box.info(f"⏳ {msg}")
-
-    progress("Conectando às APIs...")
-    hotmart_records, guru_records = [], []
-
+    # 1. Baseline histórico
+    status_box.info("⏳ Carregando baseline histórico...")
     try:
-        hotmart_records = hotmart_fetch_all(progress)
+        df_baseline = load_baseline_from_gist()
     except Exception as e:
-        st.error(f"Erro Hotmart: {e}")
+        st.warning(f"Baseline: {e}")
+        df_baseline = pd.DataFrame()
 
+    # Data de corte para busca incremental
+    if not df_baseline.empty:
+        last_date = df_baseline["data_primeira_compra"].max().strftime("%Y-%m-%d")
+    else:
+        last_date = "2020-01-01"
+
+    # 2. Hotmart — dados recentes
+    status_box.info(f"⏳ Hotmart: buscando vendas após {last_date}...")
+    hotmart_recent = []
     try:
-        guru_records = guru_fetch_all(progress)
+        hotmart_recent = fetch_recent_hotmart(last_date)
     except Exception as e:
-        st.error(f"Erro Guru: {e}")
+        st.warning(f"Hotmart API: {e}")
+
+    # 3. Guru — dados recentes (só Plataforma MEDsimple, filtrado em guru_normalize)
+    status_box.info(f"⏳ Guru: buscando transações após {last_date}...")
+    guru_recent = []
+    try:
+        guru_recent = fetch_recent_guru(last_date)
+    except Exception as e:
+        st.warning(f"Guru API: {e}")
 
     status_box.empty()
 
-    if not hotmart_records and not guru_records:
+    # 4. Montar DataFrame combinado
+    frames = []
+    if not df_baseline.empty:
+        # Converter baseline para formato de transações brutas para re-processar cruzamento
+        base_raw = df_baseline.rename(columns={
+            "plataforma_primeira_compra": "plataforma",
+            "data_primeira_compra": "data_compra",
+        })[["email", "telefone", "nome", "data_compra", "plataforma"]]
+        frames.append(base_raw)
+
+    if hotmart_recent:
+        frames.append(pd.DataFrame(hotmart_recent))
+    if guru_recent:
+        frames.append(pd.DataFrame(guru_recent))
+
+    if not frames:
         return pd.DataFrame()
 
-    df = pd.DataFrame(hotmart_records + guru_records)
-    df = df.dropna(subset=["data_compra"])
-    df["email"] = df["email"].fillna("")
-    df["telefone"] = df["telefone"].fillna("")
-    return find_unique_clients(df)
-
-
-def load_data_hybrid(df_hotmart_csv: pd.DataFrame, df_guru_csv: pd.DataFrame) -> pd.DataFrame:
-    """
-    Modo híbrido: usa CSVs como base histórica e busca só o que é mais recente pela API.
-    """
-    status_box = st.empty()
-    all_frames = []
-
-    if not df_hotmart_csv.empty:
-        all_frames.append(df_hotmart_csv)
-        last_hotmart = df_hotmart_csv["data_compra"].max().date()
-        since_str = (last_hotmart).strftime("%Y-%m-%d")
-        status_box.info(f"⏳ Hotmart: buscando compras após {since_str}...")
-        try:
-            recent = fetch_recent_hotmart(since_str)
-            if recent:
-                all_frames.append(pd.DataFrame(recent))
-                st.caption(f"Hotmart API: +{len(recent)} vendas recentes.")
-        except Exception as e:
-            st.warning(f"Hotmart API: {e}")
-
-    if not df_guru_csv.empty:
-        all_frames.append(df_guru_csv)
-        last_guru = df_guru_csv["data_compra"].max().date()
-        since_str = last_guru.strftime("%Y-%m-%d")
-        status_box.info(f"⏳ Guru: buscando compras após {since_str}...")
-        try:
-            recent = fetch_recent_guru(since_str)
-            if recent:
-                all_frames.append(pd.DataFrame(recent))
-                st.caption(f"Guru API: +{len(recent)} transações recentes.")
-        except Exception as e:
-            st.warning(f"Guru API: {e}")
-
-    status_box.empty()
-
-    if not all_frames:
-        return pd.DataFrame()
-
-    df = pd.concat(all_frames, ignore_index=True)
+    df = pd.concat(frames, ignore_index=True)
     df = df.dropna(subset=["data_compra"])
     df["email"] = df["email"].fillna("")
     df["telefone"] = df["telefone"].fillna("")
@@ -557,42 +509,12 @@ def main():
     st.title("📊 Novos Clientes — Medsimple")
     st.caption("Primeira compra em qualquer plataforma (Hotmart + Guru cruzados por email/telefone)")
 
-    with st.sidebar:
-        # ── Upload de CSVs históricos ────────────────────────────────────────
-        st.header("Base histórica (CSV)")
-        st.caption("Faça upload dos exports da Hotmart e Guru. O app busca só os dados mais recentes pela API.")
-
-        csv_hotmart = st.file_uploader("CSV Hotmart", type=["csv"], key="csv_hotmart")
-        csv_guru = st.file_uploader("CSV Guru", type=["csv"], key="csv_guru")
-
-        st.divider()
-
-        # ── Filtros ──────────────────────────────────────────────────────────
-        st.header("Filtros")
-
-    # Carregar dados (híbrido ou só API)
-    df_hotmart_csv = pd.DataFrame()
-    df_guru_csv = pd.DataFrame()
-
-    if csv_hotmart is not None:
-        df_hotmart_csv = normalize_csv(csv_hotmart, "hotmart")
-    if csv_guru is not None:
-        df_guru_csv = normalize_csv(csv_guru, "guru")
-
-    use_hybrid = not df_hotmart_csv.empty or not df_guru_csv.empty
-
-    if use_hybrid:
-        df_full = load_data_hybrid(df_hotmart_csv, df_guru_csv)
-    else:
-        st.info("Nenhum CSV carregado — buscando histórico completo pelas APIs (pode demorar alguns minutos na primeira vez).")
-        df_full = load_data_from_api()
+    df_full = load_data()
 
     if df_full.empty:
-        with st.sidebar:
-            st.error("Sem dados. Faça upload dos CSVs ou verifique as credenciais das APIs.")
+        st.error("Sem dados. Verifique GITHUB_GIST_TOKEN e GITHUB_GIST_ID nos secrets.")
         return
 
-    # Continuar sidebar com filtros
     with st.sidebar:
         anos = ["Todos"] + sorted([str(a) for a in df_full["ano"].dropna().unique()], reverse=True)
         filtro_ano = st.selectbox("Ano", anos)
