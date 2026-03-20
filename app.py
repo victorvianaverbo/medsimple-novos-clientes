@@ -377,10 +377,9 @@ def load_data() -> pd.DataFrame:
         df_baseline = pd.DataFrame()
 
     # Data de corte para busca incremental
-    if not df_baseline.empty:
-        last_date = df_baseline["data_primeira_compra"].max().strftime("%Y-%m-%d")
-    else:
-        last_date = "2020-01-01"
+    # Baseline cobre até hoje → API só precisa cobrir os últimos 7 dias
+    from datetime import timedelta
+    last_date = (date.today() - timedelta(days=7)).strftime("%Y-%m-%d")
 
     # 2. Hotmart — dados recentes
     status_box.info(f"⏳ Hotmart: buscando vendas após {last_date}...")
