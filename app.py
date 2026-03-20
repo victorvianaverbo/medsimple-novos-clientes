@@ -110,6 +110,12 @@ def hotmart_fetch_all(progress_cb=None) -> list[dict]:
 
 
 # ── Guru ────────────────────────────────────────────────────────────────────
+GURU_BASE = "https://digitalmanager.guru/api/v2"
+GURU_TX_PATH = "/transactions"
+GURU_WINDOW_DAYS = 179  # limite da API: max 180 dias por request
+GURU_START_DATE = date(2020, 1, 1)  # busca desde o início
+
+
 def guru_headers() -> dict:
     return {
         "Authorization": f"Bearer {get_secret('GURU_TOKEN')}",
@@ -117,99 +123,108 @@ def guru_headers() -> dict:
     }
 
 
-def guru_discover_endpoint() -> tuple[str, str]:
-    """Descobre a URL base + path correto da API Guru."""
-    candidates = [
-        ("https://digitalmanager.guru/api/v2", "/transactions"),
-        ("https://digitalmanager.guru/api/v1", "/transactions"),
-        ("https://digitalmanager.guru/api/v2", "/sales"),
-        ("https://digitalmanager.guru/api/v1", "/sales"),
-        ("https://api.digitalmanager.guru/v2", "/transactions"),
-        ("https://api.digitalmanager.guru/v1", "/transactions"),
-    ]
-    for base, path in candidates:
-        try:
-            r = requests.get(f"{base}{path}", headers=guru_headers(), params={"per_page": 1}, timeout=15)
-            if r.status_code in (200, 422):
-                return base, path
-            if r.status_code == 401:
-                raise ValueError("GURU_TOKEN inválido (401)")
-        except (requests.ConnectionError, requests.Timeout):
-            continue
-    raise RuntimeError("Não foi possível descobrir o endpoint da Guru API.")
-
-
 def guru_normalize(item: dict) -> dict | None:
-    contact = item.get("contact") or item.get("subscriber") or item.get("buyer") or item.get("customer") or {}
-    email = (contact.get("email") or item.get("email") or "").strip().lower()
-    phone_code = str(contact.get("phone_local_code") or "")
-    phone_raw = str(contact.get("phone_number") or contact.get("phone") or item.get("phone_number") or "")
-    phone = "".join(filter(str.isdigit, phone_code + phone_raw))
+    contact = item.get("contact") or {}
+    email = (contact.get("email") or "").strip().lower()
+
+    # Telefone: concatenar DDI + número e remover DDI 55 do Brasil
+    phone_code = "".join(filter(str.isdigit, str(contact.get("phone_local_code") or "")))
+    phone_raw = "".join(filter(str.isdigit, str(contact.get("phone_number") or "")))
+    phone = phone_code + phone_raw
+    if phone.startswith("55") and len(phone) >= 12:
+        phone = phone[2:]
+
     if not email and not phone:
         return None
+
+    # ordered_at é Unix timestamp (segundos)
     dates = item.get("dates") or {}
-    raw_date = dates.get("ordered_at") or dates.get("started_at") or dates.get("created_at") or item.get("created_at") or ""
+    ts = dates.get("ordered_at") or dates.get("confirmed_at") or dates.get("created_at")
     try:
-        dt = pd.to_datetime(raw_date, utc=True)
+        dt = datetime.fromtimestamp(int(ts), tz=timezone.utc) if ts else None
     except Exception:
         dt = None
-    status = (item.get("status") or item.get("payment_status") or "").lower()
+
+    status = (item.get("status") or "").lower()
     if status and not any(s in status for s in PAID_STATUSES):
         return None
+
     return {
         "email": email,
         "telefone": phone,
-        "nome": (contact.get("name") or item.get("name") or "").strip(),
+        "nome": (contact.get("name") or "").strip(),
         "data_compra": dt,
         "plataforma": "guru",
     }
 
 
-def guru_fetch_path(base: str, path: str, progress_cb=None) -> list[dict]:
-    records, page = [], 1
+def guru_fetch_window(ini: date, end: date, progress_cb=None) -> list[dict]:
+    """Busca todas as transações numa janela de datas usando cursor."""
+    records = []
+    cursor = None
+    page = 1
+
     while True:
+        params = {
+            "ordered_at_ini": ini.strftime("%Y-%m-%d"),
+            "ordered_at_end": end.strftime("%Y-%m-%d"),
+            "per_page": 100,
+        }
+        if cursor:
+            params["cursor"] = cursor
+
         r = requests.get(
-            f"{base}{path}", headers=guru_headers(),
-            params={"page": page, "per_page": 100}, timeout=60,
+            f"{GURU_BASE}{GURU_TX_PATH}",
+            headers=guru_headers(),
+            params=params,
+            timeout=60,
         )
         if r.status_code == 429:
             time.sleep(30)
             continue
-        if r.status_code in (404, 405):
-            break
         r.raise_for_status()
         data = r.json()
-        items = (data if isinstance(data, list)
-                 else data.get("data") or data.get("items") or data.get("transactions") or data.get("subscriptions") or [])
-        if not items:
-            break
-        for item in items:
+
+        for item in data.get("data") or []:
             norm = guru_normalize(item)
             if norm and norm["data_compra"] is not None:
                 records.append(norm)
+
         if progress_cb:
-            progress_cb(f"Guru{path}: {len(records)} registros (página {page})...")
-        meta = (data if isinstance(data, dict) else {}).get("meta") or {}
-        if meta.get("last_page") and page >= int(meta["last_page"]):
+            progress_cb(f"Guru {ini} → {end}: {len(records)} registros (pág {page})...")
+
+        if not data.get("has_more_pages"):
             break
-        if len(items) < 100:
+        cursor = data.get("next_cursor")
+        if not cursor:
             break
         page += 1
         time.sleep(0.3)
+
     return records
 
 
 def guru_fetch_all(progress_cb=None) -> list[dict]:
-    base, tx_path = guru_discover_endpoint()
-    records = guru_fetch_path(base, tx_path, progress_cb)
-    for sub_path in ["/subscriptions", "/signatures"]:
+    """
+    Busca todo o histórico dividindo em janelas de GURU_WINDOW_DAYS dias.
+    A API exige filtro de data e limita a 180 dias por request.
+    """
+    from datetime import timedelta
+
+    records = []
+    window_start = GURU_START_DATE
+    today = date.today()
+
+    while window_start <= today:
+        window_end = min(window_start + timedelta(days=GURU_WINDOW_DAYS), today)
         try:
-            r = requests.get(f"{base}{sub_path}", headers=guru_headers(), params={"per_page": 1}, timeout=10)
-            if r.status_code == 200:
-                records += guru_fetch_path(base, sub_path, progress_cb)
-                break
-        except Exception:
-            continue
+            chunk = guru_fetch_window(window_start, window_end, progress_cb)
+            records.extend(chunk)
+        except Exception as e:
+            if progress_cb:
+                progress_cb(f"Guru: erro na janela {window_start}→{window_end}: {e}")
+        window_start = window_end + timedelta(days=1)
+
     return records
 
 
