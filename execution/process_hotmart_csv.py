@@ -4,7 +4,7 @@ Processa os exports CSV da Hotmart e salva em .tmp/hotmart_raw.csv
 
 Filtros aplicados:
   - Status in ["Aprovado", "Completo"]
-  - Produto: já vem pré-filtrado nos exports (Plataforma MEDsimple apenas)
+  - Produto: nome contém "plataforma medsimple" (case-insensitive)
 
 Formato dos CSVs:
   - Delimitador: ponto e vírgula (;)
@@ -28,6 +28,7 @@ CSV_FILES = [
 ]
 
 STATUS_VALIDOS = {"aprovado", "completo"}
+PRODUTO_FILTRO = "plataforma medsimple"
 
 
 def normalize_phone(ddd, number):
@@ -71,6 +72,7 @@ def process_file(filepath):
 
     records = []
     skipped_status = 0
+    skipped_produto = 0
     skipped_date = 0
 
     with open(filepath, encoding="utf-8-sig", errors="replace", newline="") as f:
@@ -94,6 +96,12 @@ def process_file(filepath):
                 skipped_status += 1
                 continue
 
+            if col_produto:
+                produto = str(row.get(col_produto, "") or "").strip().lower()
+                if PRODUTO_FILTRO not in produto:
+                    skipped_produto += 1
+                    continue
+
             data = parse_date(row.get(col_data, ""))
             if not data:
                 skipped_date += 1
@@ -116,7 +124,7 @@ def process_file(filepath):
                 "plataforma": "hotmart",
             })
 
-    print(f"  Válidos: {len(records)} | Ignorados status: {skipped_status} | Sem data: {skipped_date}")
+    print(f"  Válidos: {len(records)} | Ignorados status: {skipped_status} | Produto errado: {skipped_produto} | Sem data: {skipped_date}")
     return records
 
 

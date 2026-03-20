@@ -306,6 +306,33 @@ def load_baseline_from_gist() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def load_sales_from_gist() -> pd.DataFrame:
+    """Carrega sales_by_year.csv do Gist (totais de transações por ano)."""
+    token = get_secret("GITHUB_GIST_TOKEN")
+    gist_id = get_secret("GITHUB_GIST_ID")
+    if not token or not gist_id:
+        return pd.DataFrame()
+    r = requests.get(
+        f"https://api.github.com/gists/{gist_id}",
+        headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    file_info = r.json()["files"].get("sales_by_year.csv")
+    if not file_info:
+        return pd.DataFrame()
+    if file_info.get("truncated") or not file_info.get("content"):
+        r2 = requests.get(file_info["raw_url"], headers={"Authorization": f"token {token}"}, timeout=30)
+        r2.raise_for_status()
+        content = r2.text
+    else:
+        content = file_info["content"]
+    df = pd.read_csv(io.StringIO(content))
+    df["ano"] = df["ano"].astype("Int64")
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_recent_hotmart(since_date_str: str) -> list[dict]:
     """Busca vendas Hotmart aprovadas a partir de uma data."""
     since = datetime.strptime(since_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -331,6 +358,9 @@ def fetch_recent_hotmart(since_date_str: str) -> list[dict]:
         resp.raise_for_status()
         data = resp.json()
         for item in data.get("items", []):
+            product_name = ((item.get("product") or {}).get("name") or "").lower()
+            if product_name and "medsimple" not in product_name:
+                continue
             buyer = item.get("buyer") or {}
             purchase = item.get("purchase") or {}
             phone = "".join(filter(str.isdigit, str(buyer.get("phone") or buyer.get("document") or "")))
@@ -433,39 +463,74 @@ def load_data() -> pd.DataFrame:
 
 
 # ── Resumo histórico ────────────────────────────────────────────────────────
-def render_summary(df_full):
-    resumo = (
-        df_full.groupby("ano")
-        .apply(lambda g: pd.Series({
-            "Total": len(g),
-            "Hotmart": (g["plataforma_primeira_compra"] == "hotmart").sum(),
-            "Guru": (g["plataforma_primeira_compra"] == "guru").sum(),
-        }), include_groups=False)
-        .reset_index()
-        .sort_values("ano")
+def render_summary(df_full, df_sales: pd.DataFrame):
+    # Novos clientes por ano
+    novos = df_full.groupby("ano").agg(
+        Novos=("plataforma_primeira_compra", "count"),
+        Hotmart=("plataforma_primeira_compra", lambda x: (x == "hotmart").sum()),
+        Guru=("plataforma_primeira_compra", lambda x: (x == "guru").sum()),
+    ).reset_index().sort_values("ano")
+    novos["ano"] = novos["ano"].astype("Int64")
+
+    # Merge com total de vendas (inclui recompras)
+    if not df_sales.empty:
+        novos = novos.merge(
+            df_sales[["ano", "total"]].rename(columns={"total": "Vendas"}),
+            on="ano", how="left",
+        )
+        novos["Vendas"] = novos["Vendas"].fillna(0).astype(int)
+    else:
+        novos["Vendas"] = pd.NA
+
+    # Formatar coluna Ano (marcar 2026 como ao vivo)
+    ano_atual = pd.Timestamp.now().year
+    novos["Ano"] = novos["ano"].apply(
+        lambda a: f"{a} 🔴" if int(a) >= ano_atual else str(int(a))
     )
-    resumo["Ano"] = resumo["ano"].astype(int).astype(str)
-    resumo = resumo[["Ano", "Total", "Hotmart", "Guru"]]
-    total_row = pd.DataFrame([{
+
+    # Linha de total
+    total_data = {
         "Ano": "Total",
-        "Total": int(resumo["Total"].sum()),
-        "Hotmart": int(resumo["Hotmart"].sum()),
-        "Guru": int(resumo["Guru"].sum()),
-    }])
-    resumo = pd.concat([resumo, total_row], ignore_index=True)
-    st.subheader("Novos clientes por ano")
-    st.caption("Clientes únicos históricos — primeira compra em qualquer plataforma (Hotmart + Guru cruzados)")
-    st.dataframe(
-        resumo,
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "Ano": st.column_config.TextColumn("Ano"),
-            "Total": st.column_config.NumberColumn("Total", format="%d"),
-            "Hotmart": st.column_config.NumberColumn("Hotmart", format="%d"),
-            "Guru": st.column_config.NumberColumn("Guru", format="%d"),
-        },
+        "Novos": int(novos["Novos"].sum()),
+        "Hotmart": int(novos["Hotmart"].sum()),
+        "Guru": int(novos["Guru"].sum()),
+    }
+    if "Vendas" in novos.columns and not novos["Vendas"].isna().all():
+        total_data["Vendas"] = int(novos["Vendas"].sum())
+    resumo = pd.concat(
+        [novos[list(total_data.keys())], pd.DataFrame([total_data])],
+        ignore_index=True,
     )
+
+    # Colorir via Styler
+    def _color(row):
+        if row["Ano"] == "Total":
+            return ["background-color: #1e293b; color: #f8fafc; font-weight: 700"] * len(row)
+        novos_val = row["Novos"] if row["Novos"] else 1
+        guru_pct = row["Guru"] / novos_val
+        if guru_pct >= 0.8:
+            bg = "#e0f2fe"  # azul suave — Guru dominante
+        elif guru_pct <= 0.2:
+            bg = "#fff7ed"  # âmbar suave — Hotmart dominante
+        else:
+            bg = "#f0fdf4"  # verde suave — misto
+        return [f"background-color: {bg}"] * len(row)
+
+    styled = resumo.style.apply(_color, axis=1)
+
+    cols_config = {
+        "Ano": st.column_config.TextColumn("Ano"),
+        "Novos": st.column_config.NumberColumn("Novos Clientes", format="%d"),
+        "Hotmart": st.column_config.NumberColumn("Hotmart", format="%d"),
+        "Guru": st.column_config.NumberColumn("Guru", format="%d"),
+    }
+    if "Vendas" in resumo.columns:
+        cols_config["Vendas"] = st.column_config.NumberColumn("Total Vendas", format="%d",
+                                                               help="Todas as transações aprovadas, incluindo recompras")
+
+    st.subheader("Novos clientes por ano")
+    st.caption("Clientes únicos históricos — primeira compra em qualquer plataforma · 🔴 = ano corrente (atualiza via API)")
+    st.dataframe(styled, hide_index=True, use_container_width=True, column_config=cols_config)
 
 
 # ── Filtros ─────────────────────────────────────────────────────────────────
@@ -558,7 +623,12 @@ def main():
         st.error("Sem dados. Verifique GITHUB_GIST_TOKEN e GITHUB_GIST_ID nos secrets.")
         return
 
-    render_summary(df_full)
+    try:
+        df_sales = load_sales_from_gist()
+    except Exception:
+        df_sales = pd.DataFrame()
+
+    render_summary(df_full, df_sales)
     st.divider()
 
     with st.sidebar:
