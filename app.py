@@ -432,6 +432,42 @@ def load_data() -> pd.DataFrame:
     return find_unique_clients(df)
 
 
+# ── Resumo histórico ────────────────────────────────────────────────────────
+def render_summary(df_full):
+    resumo = (
+        df_full.groupby("ano")
+        .apply(lambda g: pd.Series({
+            "Total": len(g),
+            "Hotmart": (g["plataforma_primeira_compra"] == "hotmart").sum(),
+            "Guru": (g["plataforma_primeira_compra"] == "guru").sum(),
+        }), include_groups=False)
+        .reset_index()
+        .sort_values("ano")
+    )
+    resumo["Ano"] = resumo["ano"].astype(int).astype(str)
+    resumo = resumo[["Ano", "Total", "Hotmart", "Guru"]]
+    total_row = pd.DataFrame([{
+        "Ano": "Total",
+        "Total": int(resumo["Total"].sum()),
+        "Hotmart": int(resumo["Hotmart"].sum()),
+        "Guru": int(resumo["Guru"].sum()),
+    }])
+    resumo = pd.concat([resumo, total_row], ignore_index=True)
+    st.subheader("Novos clientes por ano")
+    st.caption("Clientes únicos históricos — primeira compra em qualquer plataforma (Hotmart + Guru cruzados)")
+    st.dataframe(
+        resumo,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Ano": st.column_config.TextColumn("Ano"),
+            "Total": st.column_config.NumberColumn("Total", format="%d"),
+            "Hotmart": st.column_config.NumberColumn("Hotmart", format="%d"),
+            "Guru": st.column_config.NumberColumn("Guru", format="%d"),
+        },
+    )
+
+
 # ── Filtros ─────────────────────────────────────────────────────────────────
 def apply_filters(df, ano, mes, plataforma, periodo):
     if df.empty:
@@ -521,6 +557,9 @@ def main():
     if df_full.empty:
         st.error("Sem dados. Verifique GITHUB_GIST_TOKEN e GITHUB_GIST_ID nos secrets.")
         return
+
+    render_summary(df_full)
+    st.divider()
 
     with st.sidebar:
         anos = ["Todos"] + sorted([str(a) for a in df_full["ano"].dropna().unique()], reverse=True)
