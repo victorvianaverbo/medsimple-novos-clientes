@@ -139,11 +139,45 @@ def main():
         s6_content = buf6.getvalue()
         print(f"Sales 6 anos gerado: {len(df_6a)} anos | {mask_6a.sum()} transações de 6 anos")
 
+    # Gerar sales_by_product.csv (vendas por produto/oferta por ano)
+    sp_content = ""
+    if os.path.exists(HOTMART_RAW) and os.path.exists(GURU_RAW):
+        df_hm3 = pd.read_csv(HOTMART_RAW, dtype=str)
+        df_hm3["valor_liquido"] = pd.to_numeric(df_hm3.get("valor_liquido", 0), errors="coerce").fillna(0)
+        df_hm3["ano"] = pd.to_datetime(df_hm3["data_compra"], errors="coerce").dt.year
+        df_hm3["produto"] = df_hm3["nome_produto"].fillna("Sem nome")
+        df_hm3["plataforma"] = "hotmart"
+
+        df_gu3 = pd.read_csv(GURU_RAW, dtype=str)
+        df_gu3["valor_liquido"] = pd.to_numeric(df_gu3.get("valor_liquido", 0), errors="coerce").fillna(0)
+        df_gu3["ano"] = pd.to_datetime(df_gu3["data_compra"], errors="coerce").dt.year
+        df_gu3["produto"] = df_gu3["nome_oferta"].fillna(df_gu3["nome_produto"]).fillna("Sem nome")
+        df_gu3["plataforma"] = "guru"
+
+        df_all = pd.concat([
+            df_hm3[["produto", "plataforma", "ano", "valor_liquido"]],
+            df_gu3[["produto", "plataforma", "ano", "valor_liquido"]],
+        ], ignore_index=True)
+
+        sp = df_all.groupby(["produto", "plataforma", "ano"]).agg(
+            vendas=("valor_liquido", "count"),
+            receita=("valor_liquido", "sum"),
+        ).reset_index()
+        sp["receita"] = sp["receita"].round(2)
+        sp = sp.sort_values(["ano", "vendas"], ascending=[True, False])
+
+        buf_sp = io.StringIO()
+        sp.to_csv(buf_sp, index=False)
+        sp_content = buf_sp.getvalue()
+        print(f"Sales by product gerado: {len(sp)} linhas | {sp['produto'].nunique()} produtos distintos")
+
     files_payload = {"new_clients.csv": {"content": content}}
     if sales_content:
         files_payload["sales_by_year.csv"] = {"content": sales_content}
     if s6_content:
         files_payload["sales_6anos.csv"] = {"content": s6_content}
+    if sp_content:
+        files_payload["sales_by_product.csv"] = {"content": sp_content}
 
     payload = {
         "description": "Medsimple — Baseline novos clientes (gerado automaticamente)",

@@ -359,6 +359,33 @@ def load_6anos_from_gist() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def load_products_from_gist() -> pd.DataFrame:
+    """Carrega sales_by_product.csv do Gist (vendas por produto/oferta por ano)."""
+    token = get_secret("GITHUB_GIST_TOKEN")
+    gist_id = get_secret("GITHUB_GIST_ID")
+    if not token or not gist_id:
+        return pd.DataFrame()
+    r = requests.get(
+        f"https://api.github.com/gists/{gist_id}",
+        headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    file_info = r.json()["files"].get("sales_by_product.csv")
+    if not file_info:
+        return pd.DataFrame()
+    if file_info.get("truncated") or not file_info.get("content"):
+        r2 = requests.get(file_info["raw_url"], headers={"Authorization": f"token {token}"}, timeout=30)
+        r2.raise_for_status()
+        content = r2.text
+    else:
+        content = file_info["content"]
+    df = pd.read_csv(io.StringIO(content))
+    df["ano"] = df["ano"].astype("Int64")
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_recent_hotmart(since_date_str: str) -> list[dict]:
     """Busca vendas Hotmart aprovadas a partir de uma data."""
     since = datetime.strptime(since_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -706,6 +733,89 @@ def render_6anos(df_6a: pd.DataFrame):
         st.bar_chart(pct_data, use_container_width=True, color="#f59e0b")
 
 
+def render_produtos(df_prod: pd.DataFrame):
+    """Renderiza a aba de vendas por produto."""
+    if df_prod.empty:
+        st.info("Dados de vendas por produto não disponíveis. Execute publish_baseline.py para gerar.")
+        return
+
+    st.subheader("Vendas por Produto / Oferta")
+    st.caption("Hotmart: agrupado por nome do produto · Guru: agrupado por nome da oferta (mais detalhado)")
+
+    # Resumo por produto (todas os anos somados)
+    resumo = df_prod.groupby(["produto", "plataforma"]).agg(
+        vendas=("vendas", "sum"),
+        receita=("receita", "sum"),
+    ).reset_index()
+    resumo["ticket_medio"] = (resumo["receita"] / resumo["vendas"]).round(2)
+    total_vendas = resumo["vendas"].sum()
+    total_receita = resumo["receita"].sum()
+    resumo["pct_vendas"] = (resumo["vendas"] / total_vendas * 100).round(1)
+    resumo["pct_receita"] = (resumo["receita"] / total_receita * 100).round(1)
+    resumo = resumo.sort_values("vendas", ascending=False)
+
+    # KPIs
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Produtos/Ofertas", f"{resumo['produto'].nunique()}")
+    top = resumo.iloc[0]
+    c2.metric("Mais Vendido", top["produto"][:30])
+    c3.metric("Total Vendas", f"{int(total_vendas):,}".replace(",", "."))
+    c4.metric("Receita Total", f"R$ {total_receita:,.0f}".replace(",", "."))
+
+    st.divider()
+
+    # Tabela resumo por produto
+    st.subheader("Resumo por Produto")
+    display = resumo.copy()
+    display["Produto"] = display["produto"]
+    display["Plataforma"] = display["plataforma"].str.capitalize()
+    display["Vendas"] = display["vendas"].astype(int)
+    display["Receita (R$)"] = display["receita"].apply(lambda v: f"{v:,.0f}".replace(",", "."))
+    display["Ticket Médio (R$)"] = display["ticket_medio"].apply(lambda v: f"{v:,.0f}".replace(",", "."))
+    display["% Vendas"] = display["pct_vendas"]
+    display["% Receita"] = display["pct_receita"]
+
+    show_cols = ["Produto", "Plataforma", "Vendas", "Receita (R$)", "Ticket Médio (R$)", "% Vendas", "% Receita"]
+
+    def _color_prod(row):
+        pct = row["% Vendas"]
+        if pct >= 10:
+            bg = "#e0f2fe"  # azul — produto principal
+        elif pct >= 3:
+            bg = "#f0fdf4"  # verde — relevante
+        elif pct >= 1:
+            bg = "#fefce8"  # amarelo — moderado
+        else:
+            bg = "#f8fafc"  # cinza — baixo volume
+        return [f"background-color: {bg}"] * len(row)
+
+    styled = display[show_cols].style.apply(_color_prod, axis=1)
+    st.dataframe(styled, hide_index=True, use_container_width=True)
+
+    st.divider()
+
+    # Gráfico barras horizontais - Top 10 por vendas
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Top 10 — Por Volume de Vendas")
+        top10 = resumo.head(10).set_index("produto")[["vendas"]].rename(columns={"vendas": "Vendas"})
+        st.bar_chart(top10, use_container_width=True, horizontal=True)
+    with col2:
+        st.subheader("Top 10 — Por Receita")
+        top10r = resumo.head(10).set_index("produto")[["receita"]].rename(columns={"receita": "Receita (R$)"})
+        st.bar_chart(top10r, use_container_width=True, horizontal=True, color="#10b981")
+
+    st.divider()
+
+    # Evolução por ano dos top 5 produtos
+    st.subheader("Evolução Anual — Top 5 Produtos")
+    top5 = resumo.head(5)["produto"].tolist()
+    evol = df_prod[df_prod["produto"].isin(top5)].pivot_table(
+        index="ano", columns="produto", values="vendas", aggfunc="sum", fill_value=0
+    )
+    st.bar_chart(evol, use_container_width=True)
+
+
 def main():
     st.title("📊 Novos Clientes — Medsimple")
 
@@ -725,7 +835,12 @@ def main():
     except Exception:
         df_6anos = pd.DataFrame()
 
-    tab1, tab2 = st.tabs(["Novos Clientes", "Plano 6 Anos"])
+    try:
+        df_produtos = load_products_from_gist()
+    except Exception:
+        df_produtos = pd.DataFrame()
+
+    tab1, tab2, tab3 = st.tabs(["Novos Clientes", "Plano 6 Anos", "Vendas por Produto"])
 
     with tab1:
         st.caption("Primeira compra em qualquer plataforma (Hotmart + Guru cruzados por email/telefone)")
@@ -760,6 +875,9 @@ def main():
 
     with tab2:
         render_6anos(df_6anos)
+
+    with tab3:
+        render_produtos(df_produtos)
 
 
 main()
