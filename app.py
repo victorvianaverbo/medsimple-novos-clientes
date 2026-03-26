@@ -333,6 +333,32 @@ def load_sales_from_gist() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def load_6anos_from_gist() -> pd.DataFrame:
+    """Carrega sales_6anos.csv do Gist (impacto planos de 6 anos por ano)."""
+    token = get_secret("GITHUB_GIST_TOKEN")
+    gist_id = get_secret("GITHUB_GIST_ID")
+    if not token or not gist_id:
+        return pd.DataFrame()
+    r = requests.get(
+        f"https://api.github.com/gists/{gist_id}",
+        headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    file_info = r.json()["files"].get("sales_6anos.csv")
+    if not file_info:
+        return pd.DataFrame()
+    if file_info.get("truncated") or not file_info.get("content"):
+        r2 = requests.get(file_info["raw_url"], headers={"Authorization": f"token {token}"}, timeout=30)
+        r2.raise_for_status()
+        content = r2.text
+    else:
+        content = file_info["content"]
+    df = pd.read_csv(io.StringIO(content))
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_recent_hotmart(since_date_str: str) -> list[dict]:
     """Busca vendas Hotmart aprovadas a partir de uma data."""
     since = datetime.strptime(since_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -613,9 +639,75 @@ def render_table(df):
     st.download_button("Baixar CSV", csv, "novos_clientes.csv", "text/csv")
 
 
+# ── Aba Plano 6 Anos ──────────────────────────────────────────────────────
+def render_6anos(df_6a: pd.DataFrame):
+    """Renderiza a aba de análise dos planos de 6 anos."""
+    if df_6a.empty:
+        st.info("Dados de planos de 6 anos não disponíveis. Execute publish_baseline.py para gerar.")
+        return
+
+    st.subheader("Impacto dos Planos de 6 Anos nas Vendas")
+    st.caption("Transações aprovadas cujo nome da oferta contém '6 ano' (Guru) · Hotmart não tem planos de 6 anos")
+
+    # KPIs
+    total_6a = int(df_6a["trans_6anos"].sum())
+    total_all = int(df_6a["trans_total"].sum())
+    rec_6a = df_6a["receita_6anos"].sum()
+    rec_all = df_6a["receita_total"].sum()
+    pct_trans = total_6a / total_all * 100 if total_all else 0
+    pct_rec = rec_6a / rec_all * 100 if rec_all else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Vendas 6 Anos (total)", f"{total_6a:,}".replace(",", "."))
+    c2.metric("% das Transações", f"{pct_trans:.1f}%")
+    c3.metric("Receita 6 Anos", f"R$ {rec_6a:,.0f}".replace(",", "."))
+    c4.metric("% da Receita", f"{pct_rec:.1f}%")
+
+    st.divider()
+
+    # Tabela por ano
+    ano_atual = pd.Timestamp.now().year
+    display = df_6a.copy()
+    display["Ano"] = display["ano"].apply(lambda a: f"{int(a)} 🔴" if int(a) >= ano_atual else str(int(a)))
+    display["Vendas 6 Anos"] = display["trans_6anos"].astype(int)
+    display["Vendas Demais"] = display["trans_outros"].astype(int)
+    display["Total"] = display["trans_total"].astype(int)
+    display["% 6 Anos"] = (display["trans_6anos"] / display["trans_total"] * 100).round(1)
+    display["Receita 6 Anos (R$)"] = display["receita_6anos"].apply(lambda v: f"{v:,.0f}".replace(",", "."))
+    display["Receita Demais (R$)"] = display["receita_outros"].apply(lambda v: f"{v:,.0f}".replace(",", "."))
+    display["Receita Total (R$)"] = display["receita_total"].apply(lambda v: f"{v:,.0f}".replace(",", "."))
+
+    show_cols = ["Ano", "Vendas 6 Anos", "Vendas Demais", "Total", "% 6 Anos",
+                 "Receita 6 Anos (R$)", "Receita Demais (R$)", "Receita Total (R$)"]
+
+    def _color_6a(row):
+        pct = row["% 6 Anos"]
+        if pct >= 5:
+            bg = "#fef3c7"  # amarelo — impacto significativo
+        elif pct >= 2:
+            bg = "#f0fdf4"  # verde claro — impacto moderado
+        else:
+            bg = "#f8fafc"  # cinza claro — baixo impacto
+        return [f"background-color: {bg}"] * len(row)
+
+    styled = display[show_cols].style.apply(_color_6a, axis=1)
+    st.dataframe(styled, hide_index=True, use_container_width=True)
+
+    # Gráfico
+    st.divider()
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Transações: 6 Anos vs Demais")
+        chart_data = display.set_index("Ano")[["Vendas 6 Anos", "Vendas Demais"]]
+        st.bar_chart(chart_data, use_container_width=True)
+    with col2:
+        st.subheader("% de Vendas — Plano 6 Anos")
+        pct_data = display.set_index("Ano")[["% 6 Anos"]]
+        st.bar_chart(pct_data, use_container_width=True, color="#f59e0b")
+
+
 def main():
     st.title("📊 Novos Clientes — Medsimple")
-    st.caption("Primeira compra em qualquer plataforma (Hotmart + Guru cruzados por email/telefone)")
 
     df_full = load_data()
 
@@ -628,34 +720,46 @@ def main():
     except Exception:
         df_sales = pd.DataFrame()
 
-    render_summary(df_full, df_sales)
-    st.divider()
+    try:
+        df_6anos = load_6anos_from_gist()
+    except Exception:
+        df_6anos = pd.DataFrame()
 
-    with st.sidebar:
-        anos = ["Todos"] + sorted([str(a) for a in df_full["ano"].dropna().unique()], reverse=True)
-        filtro_ano = st.selectbox("Ano", anos)
-        filtro_mes = st.selectbox("Mês", ["Todos"] + list(MESES.values()))
-        st.divider()
-        usar_periodo = st.checkbox("Período personalizado")
-        filtro_periodo = None
-        if usar_periodo:
-            dmin = df_full["data_primeira_compra"].min().date()
-            dmax = df_full["data_primeira_compra"].max().date()
-            c1, c2 = st.columns(2)
-            s = c1.date_input("De", value=date(2024, 1, 1), min_value=dmin, max_value=dmax)
-            e = c2.date_input("Até", value=dmax, min_value=dmin, max_value=dmax)
-            filtro_periodo = (s, e)
-        st.divider()
-        filtro_plataforma = st.radio("Plataforma", ["Todas", "Hotmart", "Guru"])
-        st.divider()
-        if st.button("🔄 Recarregar API", use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
+    tab1, tab2 = st.tabs(["Novos Clientes", "Plano 6 Anos"])
 
-    df_filtered = apply_filters(df_full, filtro_ano, filtro_mes, filtro_plataforma, filtro_periodo)
-    render_kpis(df_filtered, df_full)
-    render_charts(df_filtered)
-    render_table(df_filtered)
+    with tab1:
+        st.caption("Primeira compra em qualquer plataforma (Hotmart + Guru cruzados por email/telefone)")
+        render_summary(df_full, df_sales)
+        st.divider()
+
+        with st.sidebar:
+            anos = ["Todos"] + sorted([str(a) for a in df_full["ano"].dropna().unique()], reverse=True)
+            filtro_ano = st.selectbox("Ano", anos)
+            filtro_mes = st.selectbox("Mês", ["Todos"] + list(MESES.values()))
+            st.divider()
+            usar_periodo = st.checkbox("Período personalizado")
+            filtro_periodo = None
+            if usar_periodo:
+                dmin = df_full["data_primeira_compra"].min().date()
+                dmax = df_full["data_primeira_compra"].max().date()
+                c1, c2 = st.columns(2)
+                s = c1.date_input("De", value=date(2024, 1, 1), min_value=dmin, max_value=dmax)
+                e = c2.date_input("Até", value=dmax, min_value=dmin, max_value=dmax)
+                filtro_periodo = (s, e)
+            st.divider()
+            filtro_plataforma = st.radio("Plataforma", ["Todas", "Hotmart", "Guru"])
+            st.divider()
+            if st.button("🔄 Recarregar API", use_container_width=True):
+                st.cache_data.clear()
+                st.rerun()
+
+        df_filtered = apply_filters(df_full, filtro_ano, filtro_mes, filtro_plataforma, filtro_periodo)
+        render_kpis(df_filtered, df_full)
+        render_charts(df_filtered)
+        render_table(df_filtered)
+
+    with tab2:
+        render_6anos(df_6anos)
 
 
 main()

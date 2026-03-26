@@ -87,8 +87,9 @@ def process_file(filepath):
         col_tel = find_col(headers, "telefone")
         col_data = find_col(headers, "confirma")  # "Data de Confirmação"
         col_produto = find_col(headers, "nome do produto", "produto")
+        col_valor = find_col(headers, "faturamento", "valor que você recebeu convertido", "preço da oferta")
 
-        print(f"  status={col_status} | email={col_email} | nome={col_nome} | tel={col_tel} | data={col_data} | produto={col_produto}")
+        print(f"  status={col_status} | email={col_email} | nome={col_nome} | tel={col_tel} | data={col_data} | produto={col_produto} | valor={col_valor}")
 
         for row in reader:
             status = str(row.get(col_status, "") or "").strip().lower()
@@ -116,12 +117,22 @@ def process_file(filepath):
             if not email and not telefone:
                 continue
 
+            valor_raw = str(row.get(col_valor, "") or "").strip().replace(",", ".") if col_valor else ""
+            try:
+                valor = float(valor_raw)
+            except ValueError:
+                valor = 0.0
+
+            nome_produto_raw = str(row.get(col_produto, "") or "").strip() if col_produto else ""
+
             records.append({
                 "email": email,
                 "telefone": telefone,
                 "nome": nome,
                 "data_compra": data,
                 "plataforma": "hotmart",
+                "valor_liquido": valor,
+                "nome_produto": nome_produto_raw,
             })
 
     print(f"  Válidos: {len(records)} | Ignorados status: {skipped_status} | Produto errado: {skipped_produto} | Sem data: {skipped_date}")
@@ -151,7 +162,7 @@ def main():
 
     os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
     with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["email", "telefone", "nome", "data_compra", "plataforma"])
+        writer = csv.DictWriter(f, fieldnames=["email", "telefone", "nome", "data_compra", "plataforma", "valor_liquido", "nome_produto"])
         writer.writeheader()
         writer.writerows(unique)
 

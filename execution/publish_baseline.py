@@ -98,9 +98,52 @@ def main():
         "Accept": "application/vnd.github+json",
     }
 
+    # Gerar sales_6anos.csv (impacto dos planos de 6 anos por ano)
+    s6_content = ""
+    if os.path.exists(GURU_RAW):
+        df_gu2 = pd.read_csv(GURU_RAW, dtype=str)
+        df_gu2["valor_liquido"] = pd.to_numeric(df_gu2.get("valor_liquido", 0), errors="coerce").fillna(0)
+        df_gu2["ano"] = pd.to_datetime(df_gu2["data_compra"], errors="coerce").dt.year
+        df_gu2["nome_oferta"] = df_gu2.get("nome_oferta", "").fillna("")
+        mask_6a = df_gu2["nome_oferta"].str.lower().str.contains("6 ano", na=False)
+
+        # Também incluir Hotmart (sem planos de 6 anos)
+        if os.path.exists(HOTMART_RAW):
+            df_hm2 = pd.read_csv(HOTMART_RAW, dtype=str)
+            df_hm2["valor_liquido"] = pd.to_numeric(df_hm2.get("valor_liquido", 0), errors="coerce").fillna(0)
+            df_hm2["ano"] = pd.to_datetime(df_hm2["data_compra"], errors="coerce").dt.year
+        else:
+            df_hm2 = pd.DataFrame(columns=["ano", "valor_liquido"])
+
+        rows_6a = []
+        all_anos = sorted(set(df_gu2["ano"].dropna().unique()) | set(df_hm2["ano"].dropna().unique()))
+        for ano in all_anos:
+            g6 = df_gu2[(df_gu2["ano"] == ano) & mask_6a]
+            g_gu = df_gu2[df_gu2["ano"] == ano]
+            g_hm = df_hm2[df_hm2["ano"] == ano] if not df_hm2.empty else pd.DataFrame()
+            total_trans = len(g_gu) + len(g_hm)
+            total_rec = g_gu["valor_liquido"].sum() + (g_hm["valor_liquido"].sum() if not g_hm.empty else 0)
+            rows_6a.append({
+                "ano": int(ano),
+                "trans_6anos": len(g6),
+                "receita_6anos": round(g6["valor_liquido"].sum(), 2),
+                "trans_outros": total_trans - len(g6),
+                "receita_outros": round(total_rec - g6["valor_liquido"].sum(), 2),
+                "trans_total": total_trans,
+                "receita_total": round(total_rec, 2),
+            })
+
+        df_6a = pd.DataFrame(rows_6a)
+        buf6 = io.StringIO()
+        df_6a.to_csv(buf6, index=False)
+        s6_content = buf6.getvalue()
+        print(f"Sales 6 anos gerado: {len(df_6a)} anos | {mask_6a.sum()} transações de 6 anos")
+
     files_payload = {"new_clients.csv": {"content": content}}
     if sales_content:
         files_payload["sales_by_year.csv"] = {"content": sales_content}
+    if s6_content:
+        files_payload["sales_6anos.csv"] = {"content": s6_content}
 
     payload = {
         "description": "Medsimple — Baseline novos clientes (gerado automaticamente)",

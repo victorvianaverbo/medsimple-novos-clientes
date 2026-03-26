@@ -77,6 +77,10 @@ def process_file(filepath):
             col_map["status"] = i
         elif "aprovacao" in h_lower or "aprovação" in h_lower:
             col_map["data_aprovacao"] = i
+        elif "valor" in h_lower and ("líquido" in h_lower or "liquido" in h_lower):
+            col_map["valor_liquido"] = i
+        elif "oferta" in h_lower and "nome" in h_lower and "url" not in h_lower:
+            col_map["nome_oferta"] = i
 
     print(f"  Colunas mapeadas: {col_map}")
 
@@ -107,12 +111,24 @@ def process_file(filepath):
         if not data:
             continue
 
+        valor_raw = row[col_map["valor_liquido"]] if "valor_liquido" in col_map else None
+        try:
+            valor = float(str(valor_raw or "0").replace(",", "."))
+        except (ValueError, TypeError):
+            valor = 0.0
+
+        nome_produto_raw = str(row[col_map.get("nome_produto", -1)] or "").strip() if "nome_produto" in col_map else ""
+        nome_oferta_raw = str(row[col_map.get("nome_oferta", -1)] or "").strip() if "nome_oferta" in col_map else ""
+
         records.append({
             "email": email,
             "telefone": telefone,
             "nome": nome,
             "data_compra": data,
             "plataforma": "guru",
+            "valor_liquido": valor,
+            "nome_produto": nome_produto_raw,
+            "nome_oferta": nome_oferta_raw,
         })
 
     wb.close()
@@ -143,7 +159,7 @@ def main():
 
     os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
     with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["email", "telefone", "nome", "data_compra", "plataforma"])
+        writer = csv.DictWriter(f, fieldnames=["email", "telefone", "nome", "data_compra", "plataforma", "valor_liquido", "nome_produto", "nome_oferta"])
         writer.writeheader()
         writer.writerows(unique)
 

@@ -54,6 +54,11 @@ def load_platform(filepath, platform_name):
     df["email"] = df["email"].apply(normalize_email)
     df["telefone"] = df["telefone"].apply(normalize_phone)
     df["data_compra"] = pd.to_datetime(df["data_compra"], errors="coerce", utc=True)
+    df["valor_liquido"] = pd.to_numeric(df.get("valor_liquido", 0), errors="coerce").fillna(0)
+    if "nome_produto" not in df.columns:
+        df["nome_produto"] = ""
+    else:
+        df["nome_produto"] = df["nome_produto"].fillna("")
     df = df.dropna(subset=["data_compra"])
     print(f"[{platform_name.upper()}] {len(df)} registros carregados.")
     return df
@@ -106,32 +111,33 @@ def merge_by_email_and_phone(df):
 
 def identify_new_clients(df):
     """
-    Para cada cliente único, encontra a data da primeira compra.
+    Para cada cliente único, encontra a data da primeira compra e agrega métricas.
     Retorna um df com um registro por cliente.
     """
-    # Agrupar por client_id para encontrar primeira compra
+    # Primeira compra por cliente
     first_purchase = df.sort_values("data_compra").groupby("client_id").first().reset_index()
 
-    # Adicionar ano e mês
-    first_purchase["ano"] = first_purchase["data_compra"].dt.year
-    first_purchase["mes"] = first_purchase["data_compra"].dt.month
-    first_purchase["data_primeira_compra"] = first_purchase["data_compra"].dt.strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
+    # Agregações: LTV (soma), nº de compras, data da última compra
+    agg = df.groupby("client_id").agg(
+        ltv=("valor_liquido", "sum"),
+        n_compras=("data_compra", "count"),
+        data_ultima_compra=("data_compra", "max"),
+    ).reset_index()
 
-    # Colunas finais
-    result = first_purchase[[
-        "email",
-        "telefone",
-        "nome",
-        "data_primeira_compra",
-        "plataforma",
-        "ano",
-        "mes",
-    ]].copy()
-    result = result.rename(columns={"plataforma": "plataforma_primeira_compra"})
+    result = first_purchase.merge(agg, on="client_id", how="left")
 
-    return result
+    # Formatar datas e valores
+    result["ano"] = result["data_compra"].dt.year
+    result["mes"] = result["data_compra"].dt.month
+    result["data_primeira_compra"] = result["data_compra"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    result["data_ultima_compra"] = result["data_ultima_compra"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    result["ltv"] = result["ltv"].fillna(0).round(2)
+    result["n_compras"] = result["n_compras"].fillna(1).astype(int)
+
+    return result[[
+        "email", "telefone", "nome", "data_primeira_compra", "plataforma",
+        "ano", "mes", "ltv", "n_compras", "data_ultima_compra", "nome_produto",
+    ]].rename(columns={"plataforma": "plataforma_primeira_compra"})
 
 
 def print_summary(df):
