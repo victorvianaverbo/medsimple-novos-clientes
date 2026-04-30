@@ -171,6 +171,76 @@ def main():
         sp_content = buf_sp.getvalue()
         print(f"Sales by product gerado: {len(sp)} linhas | {sp['produto'].nunique()} produtos distintos")
 
+    # Gerar renewals_2026.csv (taxa de renovação mensal — só 2026)
+    rn_content = ""
+    if os.path.exists(HOTMART_RAW) and os.path.exists(GURU_RAW):
+        df_hm4 = pd.read_csv(HOTMART_RAW, dtype=str)
+        df_hm4["plataforma"] = "hotmart"
+        df_gu4 = pd.read_csv(GURU_RAW, dtype=str)
+        df_gu4["plataforma"] = "guru"
+        df_tx = pd.concat([
+            df_hm4[["email", "telefone", "data_compra", "plataforma"]],
+            df_gu4[["email", "telefone", "data_compra", "plataforma"]],
+        ], ignore_index=True)
+        df_tx["email"] = df_tx["email"].fillna("").str.strip().str.lower()
+        df_tx["telefone"] = df_tx["telefone"].fillna("").astype(str).str.replace(r"\D", "", regex=True)
+        df_tx["data_compra"] = pd.to_datetime(df_tx["data_compra"], errors="coerce")
+        df_tx = df_tx.dropna(subset=["data_compra"]).reset_index(drop=True)
+
+        # Union-Find por email OU telefone
+        parent = {i: i for i in df_tx.index}
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        def union(a, b):
+            parent[find(a)] = find(b)
+
+        emap, pmap = {}, {}
+        for i, row in df_tx.iterrows():
+            e, p = row["email"], row["telefone"]
+            if e:
+                if e in emap: union(i, emap[e])
+                emap.setdefault(e, i)
+            if p and len(p) >= 8:
+                if p in pmap: union(i, pmap[p])
+                pmap.setdefault(p, i)
+        df_tx["client_id"] = [find(i) for i in df_tx.index]
+
+        # Para cada transação, achar a primeira data daquele cliente
+        primeira = df_tx.groupby("client_id")["data_compra"].min().rename("primeira_compra")
+        df_tx = df_tx.merge(primeira, on="client_id")
+        df_tx["is_recompra"] = df_tx["data_compra"] > df_tx["primeira_compra"]
+
+        # Filtrar 2026 e agregar por mês
+        df_2026 = df_tx[df_tx["data_compra"].dt.year == 2026].copy()
+        df_2026["mes"] = df_2026["data_compra"].dt.month
+        rn_rows = []
+        for mes in sorted(df_2026["mes"].unique()):
+            grp = df_2026[df_2026["mes"] == mes]
+            total = len(grp)
+            recompras = int(grp["is_recompra"].sum())
+            novos = total - recompras
+            taxa = round(recompras / total * 100, 1) if total else 0
+            rn_rows.append({
+                "mes": int(mes),
+                "total_trans": total,
+                "novos": novos,
+                "recompras": recompras,
+                "taxa_renovacao_pct": taxa,
+                "hotmart_recompras": int(grp[grp["is_recompra"] & (grp["plataforma"] == "hotmart")].shape[0]),
+                "guru_recompras": int(grp[grp["is_recompra"] & (grp["plataforma"] == "guru")].shape[0]),
+            })
+        df_rn = pd.DataFrame(rn_rows)
+        rn_local = os.path.join(os.path.dirname(__file__), "..", ".tmp", "renewals_2026.csv")
+        df_rn.to_csv(rn_local, index=False)
+        buf_rn = io.StringIO()
+        df_rn.to_csv(buf_rn, index=False)
+        rn_content = buf_rn.getvalue()
+        print(f"Renewals 2026 gerado: {len(df_rn)} meses | taxa média {df_rn['taxa_renovacao_pct'].mean():.1f}%")
+        print(df_rn.to_string(index=False))
+
     files_payload = {"new_clients.csv": {"content": content}}
     if sales_content:
         files_payload["sales_by_year.csv"] = {"content": sales_content}
@@ -178,6 +248,8 @@ def main():
         files_payload["sales_6anos.csv"] = {"content": s6_content}
     if sp_content:
         files_payload["sales_by_product.csv"] = {"content": sp_content}
+    if rn_content:
+        files_payload["renewals_2026.csv"] = {"content": rn_content}
 
     payload = {
         "description": "Medsimple — Baseline novos clientes (gerado automaticamente)",

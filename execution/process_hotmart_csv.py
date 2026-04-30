@@ -14,6 +14,8 @@ Formato dos CSVs:
 
 import os
 import csv
+import shutil
+import tempfile
 from datetime import datetime
 
 OUTPUT_FILE = os.path.join(os.path.dirname(__file__), "..", ".tmp", "hotmart_raw.csv")
@@ -25,6 +27,10 @@ CSV_FILES = [
     r"F:\Downloads\sales_history_20260320151431_8219BF837955421160596342750.csv",
     r"F:\Downloads\sales_history_20260320132640_8584E6A83289272021253433931.csv",
     r"F:\Downloads\sales_history_20260320154900_5DCEB2B413074293895924279648.csv",
+]
+
+XLSX_FILES = [
+    r"F:\Downloads\sales_history_20260430174224_89AFB0589533606856776939868.xls",
 ]
 
 STATUS_VALIDOS = {"aprovado", "completo"}
@@ -139,6 +145,97 @@ def process_file(filepath):
     return records
 
 
+def process_xlsx_file(filepath):
+    """Processa exports XLSX da Hotmart (mesmo schema do CSV, mas em planilha)."""
+    import openpyxl
+    print(f"\n[Hotmart] Processando XLSX: {os.path.basename(filepath)}")
+
+    # Hotmart às vezes nomeia .xls mas o arquivo é XLSX moderno; copiar pra extensão correta
+    tmp_path = filepath
+    if not filepath.lower().endswith(".xlsx"):
+        tmp_path = os.path.join(tempfile.gettempdir(), os.path.basename(filepath) + ".xlsx")
+        shutil.copy(filepath, tmp_path)
+
+    wb = openpyxl.load_workbook(tmp_path, data_only=True)
+    ws = wb.active
+    headers = [str(c.value or "").strip() for c in ws[1]]
+
+    def col_idx(*candidates):
+        h_lower = [h.lower() for h in headers]
+        for cand in candidates:
+            cl = cand.lower()
+            for i, h in enumerate(h_lower):
+                if h == cl:
+                    return i
+            for i, h in enumerate(h_lower):
+                if cl in h:
+                    return i
+        return None
+
+    idx_status = col_idx("status")
+    idx_email = col_idx("email")
+    idx_nome = col_idx("nome")
+    idx_ddd = col_idx("ddd")
+    idx_tel = col_idx("telefone")
+    idx_data = col_idx("confirma")
+    idx_produto = col_idx("nome do produto", "produto")
+    idx_valor = col_idx("faturamento", "valor que voc")
+
+    print(f"  status={idx_status} email={idx_email} nome={idx_nome} tel={idx_tel} data={idx_data} produto={idx_produto} valor={idx_valor}")
+
+    records = []
+    skipped_status = skipped_produto = skipped_date = 0
+
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        status = str(row[idx_status] or "").strip().lower() if idx_status is not None else ""
+        if status not in STATUS_VALIDOS:
+            skipped_status += 1
+            continue
+
+        produto = str(row[idx_produto] or "").strip() if idx_produto is not None else ""
+        if PRODUTO_FILTRO not in produto.lower():
+            skipped_produto += 1
+            continue
+
+        data_val = row[idx_data] if idx_data is not None else None
+        if isinstance(data_val, datetime):
+            data = data_val.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            data = parse_date(data_val)
+        if not data:
+            skipped_date += 1
+            continue
+
+        email = str(row[idx_email] or "").strip().lower() if idx_email is not None else ""
+        nome = str(row[idx_nome] or "").strip() if idx_nome is not None else ""
+        ddd = str(row[idx_ddd] or "").strip() if idx_ddd is not None else ""
+        tel = str(row[idx_tel] or "").strip() if idx_tel is not None else ""
+        telefone = normalize_phone(ddd, tel)
+
+        if not email and not telefone:
+            continue
+
+        valor_raw = row[idx_valor] if idx_valor is not None else 0
+        try:
+            valor = float(str(valor_raw or "0").replace(",", "."))
+        except (ValueError, TypeError):
+            valor = 0.0
+
+        records.append({
+            "email": email,
+            "telefone": telefone,
+            "nome": nome,
+            "data_compra": data,
+            "plataforma": "hotmart",
+            "valor_liquido": valor,
+            "nome_produto": produto,
+        })
+
+    wb.close()
+    print(f"  Válidos: {len(records)} | Status: {skipped_status} | Produto: {skipped_produto} | Sem data: {skipped_date}")
+    return records
+
+
 def main():
     print("=" * 55)
     print("HOTMART — Processando CSVs históricos")
@@ -151,7 +248,26 @@ def main():
             continue
         all_records.extend(process_file(f))
 
-    # Remover duplicatas exatas
+    for f in XLSX_FILES:
+        if not os.path.exists(f):
+            print(f"[!] Arquivo não encontrado: {f}")
+            continue
+        all_records.extend(process_xlsx_file(f))
+
+    # Mesclar com hotmart_raw.csv existente para preservar histórico
+    if os.path.exists(OUTPUT_FILE):
+        with open(OUTPUT_FILE, "r", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            existing = list(reader)
+        print(f"\n[Hotmart] Mesclando com {len(existing)} registros existentes")
+        for r in existing:
+            try:
+                r["valor_liquido"] = float(r.get("valor_liquido") or 0)
+            except (ValueError, TypeError):
+                r["valor_liquido"] = 0.0
+            all_records.append(r)
+
+    # Dedupe por (email, telefone, data_compra) — primeira ocorrência ganha (XLSX/CSV novo vem antes)
     seen = set()
     unique = []
     for r in all_records:

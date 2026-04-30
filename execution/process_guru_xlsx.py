@@ -16,12 +16,7 @@ import openpyxl
 OUTPUT_FILE = os.path.join(os.path.dirname(__file__), "..", ".tmp", "guru_raw.csv")
 
 XLSX_FILES = [
-    r"F:\Downloads\Guru-Vendas-2026-03-20-13-19-06.xlsx",
-    r"F:\Downloads\Guru-Vendas-2026-03-20-13-18-54.xlsx",
-    r"F:\Downloads\Guru-Vendas-2026-03-20-13-18-31.xlsx",
-    r"F:\Downloads\Guru-Vendas-2026-03-20-13-18-15.xlsx",
-    r"F:\Downloads\Guru-Vendas-2026-03-20-13-14-21.xlsx",
-    r"F:\Downloads\Guru-Vendas-2026-03-20-13-10-47.xlsx",
+    r"F:\Downloads\Guru-Vendas-2026-04-30-14-21-42.xlsx",
 ]
 
 PRODUTO_FILTRO = "plataforma medsimple"
@@ -148,7 +143,20 @@ def main():
             continue
         all_records.extend(process_file(f))
 
-    # Remover duplicatas exatas (mesma transação pode aparecer em múltiplos exports)
+    # Mesclar com guru_raw.csv existente para preservar histórico anterior
+    if os.path.exists(OUTPUT_FILE):
+        with open(OUTPUT_FILE, "r", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            existing = list(reader)
+        print(f"\n[Guru] Mesclando com {len(existing)} registros existentes em guru_raw.csv")
+        for r in existing:
+            try:
+                r["valor_liquido"] = float(r.get("valor_liquido") or 0)
+            except (ValueError, TypeError):
+                r["valor_liquido"] = 0.0
+            all_records.append(r)
+
+    # Dedupe por (email, telefone, data_compra) — primeira ocorrência ganha (XLSX novo vem antes)
     seen = set()
     unique = []
     for r in all_records:

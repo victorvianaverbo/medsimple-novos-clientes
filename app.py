@@ -386,6 +386,36 @@ def load_products_from_gist() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def load_renewals_from_gist() -> pd.DataFrame:
+    """Carrega renewals_2026.csv do Gist; se falhar, tenta arquivo local em .tmp/."""
+    local_path = os.path.join(os.path.dirname(__file__), ".tmp", "renewals_2026.csv")
+    try:
+        token = get_secret("GITHUB_GIST_TOKEN")
+        gist_id = get_secret("GITHUB_GIST_ID")
+        if token and gist_id:
+            r = requests.get(
+                f"https://api.github.com/gists/{gist_id}",
+                headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
+                timeout=30,
+            )
+            r.raise_for_status()
+            file_info = r.json()["files"].get("renewals_2026.csv")
+            if file_info:
+                if file_info.get("truncated") or not file_info.get("content"):
+                    r2 = requests.get(file_info["raw_url"], headers={"Authorization": f"token {token}"}, timeout=30)
+                    r2.raise_for_status()
+                    content = r2.text
+                else:
+                    content = file_info["content"]
+                return pd.read_csv(io.StringIO(content))
+    except Exception:
+        pass
+    if os.path.exists(local_path):
+        return pd.read_csv(local_path)
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_recent_hotmart(since_date_str: str) -> list[dict]:
     """Busca vendas Hotmart aprovadas a partir de uma data."""
     since = datetime.strptime(since_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -816,6 +846,73 @@ def render_produtos(df_prod: pd.DataFrame):
     st.bar_chart(evol, use_container_width=True)
 
 
+def render_renewals(df_rn: pd.DataFrame):
+    """Renderiza a aba de taxa de renovação mensal — 2026."""
+    if df_rn.empty:
+        st.info("Dados de renovação não disponíveis. Execute publish_baseline.py para gerar renewals_2026.csv.")
+        return
+
+    st.subheader("Taxa de Renovação Mensal — 2026")
+    st.caption("Recompra = transação cujo cliente (cruzado por email/telefone) já tinha alguma transação anterior · Taxa = recompras ÷ total de transações do mês")
+
+    total_trans = int(df_rn["total_trans"].sum())
+    total_rec = int(df_rn["recompras"].sum())
+    taxa_acum = (total_rec / total_trans * 100) if total_trans else 0
+    taxa_media = df_rn["taxa_renovacao_pct"].mean()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Transações 2026", f"{total_trans:,}".replace(",", "."))
+    c2.metric("Recompras", f"{total_rec:,}".replace(",", "."))
+    c3.metric("Taxa Acumulada", f"{taxa_acum:.1f}%")
+    c4.metric("Taxa Média Mensal", f"{taxa_media:.1f}%")
+
+    st.divider()
+
+    display = df_rn.copy()
+    display["Mês"] = display["mes"].apply(lambda m: MESES.get(int(m), str(m)))
+    display["Total Transações"] = display["total_trans"].astype(int)
+    display["Novos"] = display["novos"].astype(int)
+    display["Recompras"] = display["recompras"].astype(int)
+    display["Taxa Renovação"] = display["taxa_renovacao_pct"]
+    display["Hotmart Recompras"] = display["hotmart_recompras"].astype(int)
+    display["Guru Recompras"] = display["guru_recompras"].astype(int)
+
+    show_cols = ["Mês", "Total Transações", "Novos", "Recompras", "Taxa Renovação",
+                 "Hotmart Recompras", "Guru Recompras"]
+
+    def _color_rn(row):
+        taxa = row["Taxa Renovação"]
+        if taxa >= 50:
+            bg = "#dcfce7"  # verde forte — alta renovação
+        elif taxa >= 30:
+            bg = "#f0fdf4"  # verde claro — saudável
+        elif taxa >= 15:
+            bg = "#fefce8"  # amarelo — moderado
+        else:
+            bg = "#fef2f2"  # vermelho claro — baixo
+        return [f"background-color: {bg}"] * len(row)
+
+    styled = display[show_cols].style.apply(_color_rn, axis=1).format({"Taxa Renovação": "{:.1f}%"})
+    st.dataframe(styled, hide_index=True, use_container_width=True, column_config={
+        "Total Transações": st.column_config.NumberColumn(format="%d"),
+        "Novos": st.column_config.NumberColumn(format="%d"),
+        "Recompras": st.column_config.NumberColumn(format="%d"),
+        "Hotmart Recompras": st.column_config.NumberColumn(format="%d"),
+        "Guru Recompras": st.column_config.NumberColumn(format="%d"),
+    })
+
+    st.divider()
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Novos vs Recompras por Mês")
+        chart = display.set_index("Mês")[["Novos", "Recompras"]]
+        st.bar_chart(chart, use_container_width=True)
+    with col2:
+        st.subheader("Taxa de Renovação Mensal (%)")
+        chart_pct = display.set_index("Mês")[["Taxa Renovação"]]
+        st.line_chart(chart_pct, use_container_width=True)
+
+
 def main():
     st.title("📊 Novos Clientes — Medsimple")
 
@@ -840,7 +937,12 @@ def main():
     except Exception:
         df_produtos = pd.DataFrame()
 
-    tab1, tab2, tab3 = st.tabs(["Novos Clientes", "Plano 6 Anos", "Vendas por Produto"])
+    try:
+        df_renewals = load_renewals_from_gist()
+    except Exception:
+        df_renewals = pd.DataFrame()
+
+    tab1, tab2, tab3, tab4 = st.tabs(["Novos Clientes", "Plano 6 Anos", "Vendas por Produto", "Renovação Mensal"])
 
     with tab1:
         st.caption("Primeira compra em qualquer plataforma (Hotmart + Guru cruzados por email/telefone)")
@@ -878,6 +980,9 @@ def main():
 
     with tab3:
         render_produtos(df_produtos)
+
+    with tab4:
+        render_renewals(df_renewals)
 
 
 main()
