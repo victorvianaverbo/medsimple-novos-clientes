@@ -241,6 +241,39 @@ def main():
         print(f"Renewals 2026 gerado: {len(df_rn)} meses | taxa média {df_rn['taxa_renovacao_pct'].mean():.1f}%")
         print(df_rn.to_string(index=False))
 
+    # Gerar planos_2026.csv (Basic/Pro/Max — Guru, mar+abr 2026)
+    pl_content = ""
+    if os.path.exists(GURU_RAW):
+        df_pl = pd.read_csv(GURU_RAW, dtype=str)
+        df_pl["valor_liquido"] = pd.to_numeric(df_pl.get("valor_liquido", 0), errors="coerce").fillna(0)
+        df_pl["dt"] = pd.to_datetime(df_pl["data_compra"], errors="coerce")
+        df_pl = df_pl[(df_pl["dt"].dt.year == 2026) & (df_pl["dt"].dt.month.isin([3, 4]))].copy()
+        df_pl["oferta_l"] = df_pl.get("nome_oferta", "").fillna("").str.lower()
+
+        def _classify(name):
+            if "basic" in name: return "Basic"
+            if "max" in name: return "Max"
+            if "pro" in name: return "Pro"
+            return None
+
+        df_pl["plano"] = df_pl["oferta_l"].apply(_classify)
+        df_pl = df_pl[df_pl["plano"].notna()].copy()
+        df_pl["mes"] = df_pl["dt"].dt.month.astype(int)
+
+        agg_pl = df_pl.groupby(["mes", "plano"]).agg(
+            vendas=("valor_liquido", "count"),
+            receita=("valor_liquido", "sum"),
+        ).reset_index()
+        agg_pl["receita"] = agg_pl["receita"].round(2)
+        agg_pl = agg_pl.sort_values(["mes", "plano"])
+
+        buf_pl = io.StringIO()
+        agg_pl.to_csv(buf_pl, index=False)
+        pl_content = buf_pl.getvalue()
+        pl_local = os.path.join(os.path.dirname(__file__), "..", ".tmp", "planos_2026.csv")
+        agg_pl.to_csv(pl_local, index=False)
+        print(f"Planos 2026 gerado: {len(agg_pl)} linhas | {int(agg_pl['vendas'].sum())} vendas")
+
     files_payload = {"new_clients.csv": {"content": content}}
     if sales_content:
         files_payload["sales_by_year.csv"] = {"content": sales_content}
@@ -250,6 +283,8 @@ def main():
         files_payload["sales_by_product.csv"] = {"content": sp_content}
     if rn_content:
         files_payload["renewals_2026.csv"] = {"content": rn_content}
+    if pl_content:
+        files_payload["planos_2026.csv"] = {"content": pl_content}
 
     payload = {
         "description": "Medsimple — Baseline novos clientes (gerado automaticamente)",

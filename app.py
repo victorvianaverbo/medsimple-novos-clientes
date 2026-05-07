@@ -386,6 +386,36 @@ def load_products_from_gist() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def load_planos_from_gist() -> pd.DataFrame:
+    """Carrega planos_2026.csv (Basic/Pro/Max — Guru mar+abr); fallback local."""
+    local_path = os.path.join(os.path.dirname(__file__), ".tmp", "planos_2026.csv")
+    try:
+        token = get_secret("GITHUB_GIST_TOKEN")
+        gist_id = get_secret("GITHUB_GIST_ID")
+        if token and gist_id:
+            r = requests.get(
+                f"https://api.github.com/gists/{gist_id}",
+                headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
+                timeout=30,
+            )
+            r.raise_for_status()
+            file_info = r.json()["files"].get("planos_2026.csv")
+            if file_info:
+                if file_info.get("truncated") or not file_info.get("content"):
+                    r2 = requests.get(file_info["raw_url"], headers={"Authorization": f"token {token}"}, timeout=30)
+                    r2.raise_for_status()
+                    content = r2.text
+                else:
+                    content = file_info["content"]
+                return pd.read_csv(io.StringIO(content))
+    except Exception:
+        pass
+    if os.path.exists(local_path):
+        return pd.read_csv(local_path)
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_renewals_from_gist() -> pd.DataFrame:
     """Carrega renewals_2026.csv do Gist; se falhar, tenta arquivo local em .tmp/."""
     local_path = os.path.join(os.path.dirname(__file__), ".tmp", "renewals_2026.csv")
@@ -846,6 +876,130 @@ def render_produtos(df_prod: pd.DataFrame):
     st.bar_chart(evol, use_container_width=True)
 
 
+def render_planos(df_pl: pd.DataFrame):
+    """Renderiza vendas por plano (Basic/Pro/Max) — Guru mar+abr 2026."""
+    if df_pl.empty:
+        st.info("Dados de planos não disponíveis. Execute publish_baseline.py para gerar planos_2026.csv.")
+        return
+
+    st.subheader("Vendas por Plano — Março e Abril 2026")
+    st.caption("Apenas Guru · classificação por nome da oferta · Basic / Pro / Max (demais ofertas excluídas)")
+
+    nome_mes = {3: "Março", 4: "Abril"}
+    df_pl = df_pl.copy()
+    df_pl["mes_nome"] = df_pl["mes"].map(nome_mes)
+
+    total_vendas = int(df_pl["vendas"].sum())
+    total_receita = df_pl["receita"].sum()
+    ticket_medio = total_receita / total_vendas if total_vendas else 0
+    plano_top = df_pl.groupby("plano")["vendas"].sum().idxmax()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Vendas", f"{total_vendas:,}".replace(",", "."))
+    c2.metric("Receita Total", f"R$ {total_receita:,.0f}".replace(",", "."))
+    c3.metric("Ticket Médio", f"R$ {ticket_medio:,.0f}".replace(",", "."))
+    c4.metric("Plano Mais Vendido", plano_top)
+
+    st.divider()
+
+    # Margem de contribuição editável (custo variável % por plano)
+    st.markdown("**Custos variáveis por plano** — ajuste pra calcular margem de contribuição")
+    cc1, cc2, cc3 = st.columns(3)
+    custo_basic_pct = cc1.number_input("Custo Basic (%)", min_value=0.0, max_value=100.0, value=30.0, step=1.0)
+    custo_pro_pct = cc2.number_input("Custo Pro (%)", min_value=0.0, max_value=100.0, value=30.0, step=1.0)
+    custo_max_pct = cc3.number_input("Custo Max (%)", min_value=0.0, max_value=100.0, value=30.0, step=1.0)
+
+    custos_map = {"Basic": custo_basic_pct, "Pro": custo_pro_pct, "Max": custo_max_pct}
+
+    # Tabela detalhada
+    display = df_pl.copy()
+    display["Mês"] = display["mes_nome"]
+    display["Plano"] = display["plano"]
+    display["Vendas"] = display["vendas"].astype(int)
+    display["custo_pct"] = display["plano"].map(custos_map)
+    display["margem_valor"] = display["receita"] * (1 - display["custo_pct"] / 100)
+
+    # % vendas e receita por mês
+    total_v_mes = df_pl.groupby("mes")["vendas"].transform("sum")
+    total_r_mes = df_pl.groupby("mes")["receita"].transform("sum")
+    display["pct_vendas"] = (df_pl["vendas"] / total_v_mes * 100).round(1)
+    display["pct_receita"] = (df_pl["receita"] / total_r_mes * 100).round(1)
+
+    display["Receita (R$)"] = display["receita"].apply(lambda v: f"{v:,.0f}".replace(",", "."))
+    display["Ticket Médio (R$)"] = (display["receita"] / display["vendas"]).round(0).apply(lambda v: f"{v:,.0f}".replace(",", "."))
+    display["% Vendas (mês)"] = display["pct_vendas"].apply(lambda v: f"{v}%")
+    display["% Receita (mês)"] = display["pct_receita"].apply(lambda v: f"{v}%")
+    display["Margem Contrib. (R$)"] = display["margem_valor"].apply(lambda v: f"{v:,.0f}".replace(",", "."))
+    display["Margem (%)"] = display["custo_pct"].apply(lambda v: f"{100-v:.0f}%")
+
+    show_cols = ["Mês", "Plano", "Vendas", "% Vendas (mês)", "Receita (R$)", "% Receita (mês)",
+                 "Ticket Médio (R$)", "Margem (%)", "Margem Contrib. (R$)"]
+
+    def _color_plano(row):
+        plano = row["Plano"]
+        if plano == "Basic":
+            bg = "#e0f2fe"  # azul claro
+        elif plano == "Pro":
+            bg = "#dcfce7"  # verde claro
+        elif plano == "Max":
+            bg = "#fef3c7"  # amarelo
+        else:
+            bg = "#f8fafc"
+        return [f"background-color: {bg}"] * len(row)
+
+    styled = display[show_cols].style.apply(_color_plano, axis=1)
+    st.dataframe(styled, hide_index=True, use_container_width=True)
+
+    st.divider()
+
+    # Gráficos
+    pivot_v = df_pl.pivot(index="mes_nome", columns="plano", values="vendas").fillna(0)
+    pivot_r = df_pl.pivot(index="mes_nome", columns="plano", values="receita").fillna(0)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Vendas por Plano e Mês")
+        st.bar_chart(pivot_v, use_container_width=True)
+    with col2:
+        st.subheader("Receita por Plano e Mês")
+        st.bar_chart(pivot_r, use_container_width=True)
+
+    st.divider()
+
+    # Resumo consolidado por plano (mar+abr) com margem
+    st.subheader("Mix Consolidado (Mar + Abr)")
+    mix = df_pl.groupby("plano").agg(
+        vendas=("vendas", "sum"),
+        receita=("receita", "sum"),
+    ).reset_index()
+    mix["pct_vendas"] = (mix["vendas"] / mix["vendas"].sum() * 100).round(1)
+    mix["pct_receita"] = (mix["receita"] / mix["receita"].sum() * 100).round(1)
+    mix["custo_pct"] = mix["plano"].map(custos_map)
+    mix["margem_valor"] = mix["receita"] * (1 - mix["custo_pct"] / 100)
+    mix["pct_margem"] = (mix["margem_valor"] / mix["margem_valor"].sum() * 100).round(1)
+
+    mix_display = mix.copy()
+    mix_display["Plano"] = mix_display["plano"]
+    mix_display["Vendas"] = mix_display["vendas"].astype(int)
+    mix_display["% Vendas"] = mix_display["pct_vendas"].apply(lambda v: f"{v}%")
+    mix_display["Receita (R$)"] = mix_display["receita"].apply(lambda v: f"{v:,.0f}".replace(",", "."))
+    mix_display["% Receita"] = mix_display["pct_receita"].apply(lambda v: f"{v}%")
+    mix_display["Margem Contrib. (R$)"] = mix_display["margem_valor"].apply(lambda v: f"{v:,.0f}".replace(",", "."))
+    mix_display["% Margem"] = mix_display["pct_margem"].apply(lambda v: f"{v}%")
+
+    st.dataframe(
+        mix_display[["Plano", "Vendas", "% Vendas", "Receita (R$)", "% Receita",
+                     "Margem Contrib. (R$)", "% Margem"]],
+        hide_index=True, use_container_width=True,
+    )
+
+    # KPI margem total
+    margem_total = mix["margem_valor"].sum()
+    st.metric("Margem de Contribuição Total (Mar + Abr)",
+              f"R$ {margem_total:,.0f}".replace(",", "."),
+              delta=f"{(margem_total / total_receita * 100):.1f}% da receita" if total_receita else None)
+
+
 def render_renewals(df_rn: pd.DataFrame):
     """Renderiza a aba de taxa de renovação mensal — 2026."""
     if df_rn.empty:
@@ -942,7 +1096,15 @@ def main():
     except Exception:
         df_renewals = pd.DataFrame()
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Novos Clientes", "Plano 6 Anos", "Vendas por Produto", "Renovação Mensal"])
+    try:
+        df_planos = load_planos_from_gist()
+    except Exception:
+        df_planos = pd.DataFrame()
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "Novos Clientes", "Plano 6 Anos", "Vendas por Produto",
+        "Renovação Mensal", "Vendas por Plano"
+    ])
 
     with tab1:
         st.caption("Primeira compra em qualquer plataforma (Hotmart + Guru cruzados por email/telefone)")
@@ -983,6 +1145,9 @@ def main():
 
     with tab4:
         render_renewals(df_renewals)
+
+    with tab5:
+        render_planos(df_planos)
 
 
 main()
